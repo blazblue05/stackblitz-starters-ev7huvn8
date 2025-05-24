@@ -1,0 +1,210 @@
+package main import ( "crypto/rand" "crypto/subtle" "database/sql"
+"encoding/base64" "fmt" "log" "net/http" "os" "strconv" "strings"
+"github.com/gin-contrib/sessions" "github.com/gin-contrib/sessions/cookie"
+"github.com/gin-gonic/gin" "golang.org/x/crypto/argon2" _ "github.com/lib/pq" )
+// Item represents an inventory item type Item struct { ID int `json:"id"` Name
+string `json:"name"` Quantity int `json:"quantity"` Price float64 `json:"price"`
+Password string `json:"password"` // Stores the hashed password } // User
+represents a user for authentication type User struct { ID int Username string
+Password string // Hashed password } // Argon2id parameters const ( argon2Memory
+= 64 * 1024 // 64 MB argon2Iterations = 3 argon2Parallelism = 2 argon2SaltLength
+= 16 argon2KeyLength = 32 ) // hashPassword hashes a password using Argon2id
+func hashPassword(password string) (string, error) { salt := make([]byte,
+argon2SaltLength) if _, err := rand.Read(salt); err != nil { return "",
+fmt.Errorf("failed to generate salt: %v", err) } hash :=
+argon2.IDKey([]byte(password), salt, argon2Iterations, argon2Memory,
+argon2Parallelism, argon2KeyLength) saltB64 :=
+base64.RawStdEncoding.EncodeToString(salt) hashB64 :=
+base64.RawStdEncoding.EncodeToString(hash) encoded :=
+fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s", argon2.Version, argon2Memory,
+argon2Iterations, argon2Parallelism, saltB64, hashB64) return encoded, nil } //
+verifyPassword verifies a password against a stored hash func
+verifyPassword(password, encodedHash string) (bool, error) { parts :=
+strings.Split(encodedHash, "$") if len(parts) != 6 || parts[1] != "argon2id" {
+return false, fmt.Errorf("invalid hash format") } var version int _, err :=
+fmt.Sscanf(parts[2], "v=%d", &version) if err != nil || version !=
+argon2.Version { return false, fmt.Errorf("invalid argon2 version") } var
+memory, iterations uint32 var parallelism uint8 _, err = fmt.Sscanf(parts[3],
+"m=%d,t=%d,p=%d", &memory, &iterations, &parallelism) if err != nil { return
+false, fmt.Errorf("invalid parameters: %v", err) } salt, err :=
+base64.RawStdEncoding.DecodeString(parts[4]) if err != nil { return false,
+fmt.Errorf("failed to decode salt: %v", err) } hash, err :=
+base64.RawStdEncoding.DecodeString(parts[5]) if err != nil { return false,
+fmt.Errorf("failed to decode hash: %v", err) } computedHash :=
+argon2.IDKey([]byte(password), salt, iterations, memory, parallelism,
+uint32(len(hash))) if subtle.ConstantTimeCompare(hash, computedHash) == 1 {
+return true, nil } return false, nil } // InventoryManager manages the inventory
+type InventoryManager struct { db *sql.DB } // NewInventoryManager creates a new
+inventory manager with a database connection func NewInventoryManager(db
+*sql.DB) (*InventoryManager, error) { // Create items table _, err := db.Exec(`
+CREATE TABLE IF NOT EXISTS items ( id SERIAL PRIMARY KEY, name TEXT NOT NULL,
+quantity INTEGER NOT NULL CHECK (quantity >= 0), price DOUBLE PRECISION NOT NULL
+CHECK (price >= 0), password TEXT ) `) if err != nil { return nil,
+fmt.Errorf("failed to create items table: %v", err) } // Create users table _,
+err = db.Exec(` CREATE TABLE IF NOT EXISTS users ( id SERIAL PRIMARY KEY,
+username TEXT NOT NULL UNIQUE, password TEXT NOT NULL ) `) if err != nil {
+return nil, fmt.Errorf("failed to create users table: %v", err) } return
+&InventoryManager{db: db}, nil } // AddItem adds a new item to the inventory
+func (im *InventoryManager) AddItem(name string, quantity int, price float64,
+password string) error { if name == "" { return fmt.Errorf("item name cannot be
+empty") } if quantity < 0 { return fmt.Errorf("quantity cannot be negative") }
+if price < 0 { return fmt.Errorf("price cannot be negative") } var
+hashedPassword string if password != "" { var err error hashedPassword, err =
+hashPassword(password) if err != nil { return fmt.Errorf("failed to hash
+password: %v", err) } } _, err := im.db.Exec( "INSERT INTO items (name,
+quantity, price, password) VALUES ($1, $2, $3, $4)", name, quantity, price,
+hashedPassword, ) if err != nil { return fmt.Errorf("failed to add item: %v",
+err) } return nil } // ListItems retrieves all items func (im *InventoryManager)
+ListItems() ([]Item, error) { log.Println("Querying items from database...")
+rows, err := im.db.Query("SELECT id, name, quantity, price, password FROM
+items") if err != nil { log.Printf("Error querying items: %v", err) return nil,
+fmt.Errorf("failed to list items: %v", err) } defer rows.Close() items :=
+[]Item{} for rows.Next() { var item Item var password sql.NullString if err :=
+rows.Scan(&item.ID, &item.Name, &item.Quantity, &item.Price, &password); err !=
+nil { log.Printf("Error scanning item: %v", err) return nil, fmt.Errorf("failed
+to scan item: %v", err) } if password.Valid && password.String != "" {
+item.Password = "****" } else { item.Password = "" } items = append(items, item)
+} log.Printf("Successfully retrieved %d items", len(items)) return items, nil }
+// UpdateItem updates an existing item func (im *InventoryManager) UpdateItem(id
+int, name string, quantity int, price float64, password string) error { if name
+== "" { return fmt.Errorf("item name cannot be empty") } if quantity < 0 {
+return fmt.Errorf("quantity cannot be negative") } if price < 0 { return
+fmt.Errorf("price cannot be negative") } var hashedPassword string if password
+!= "" { var err error hashedPassword, err = hashPassword(password) if err != nil
+{ return fmt.Errorf("failed to hash password: %v", err) } } result, err :=
+im.db.Exec( "UPDATE items SET name = $1, quantity = $2, price = $3, password =
+$4 WHERE id = $5", name, quantity, price, hashedPassword, id, ) if err != nil {
+return fmt.Errorf("failed to update item: %v", err) } rowsAffected, err :=
+result.RowsAffected() if err != nil { return fmt.Errorf("failed to check update
+result: %v", err) } if rowsAffected == 0 { return fmt.Errorf("item with ID %d
+not found", id) } return nil } // DeleteItem removes an item by ID func (im
+*InventoryManager) DeleteItem(id int) error { result, err := im.db.Exec("DELETE
+FROM items WHERE id = $1", id) if err != nil { return fmt.Errorf("failed to
+delete item: %v", err) } rowsAffected, err := result.RowsAffected() if err !=
+nil { return fmt.Errorf("failed to check delete result: %v", err) } if
+rowsAffected == 0 { return fmt.Errorf("item with ID %d not found", id) } return
+nil } // GetItem retrieves an item by ID func (im *InventoryManager) GetItem(id
+int) (*Item, error) { var item Item var password sql.NullString err :=
+im.db.QueryRow("SELECT id, name, quantity, price, password FROM items WHERE id =
+$1", id). Scan(&item.ID, &item.Name, &item.Quantity, &item.Price, &password) if
+err != nil { if err == sql.ErrNoRows { return nil, fmt.Errorf("item with ID %d
+not found", id) } return nil, fmt.Errorf("failed to get item: %v", err) } if
+password.Valid && password.String != "" { item.Password = "****" } else {
+item.Password = "" } return &item, nil } // AuthenticateUser verifies user
+credentials func (im *InventoryManager) AuthenticateUser(username, password
+string) (bool, error) { log.Printf("Authenticating user: %s", username) var
+storedHash string err := im.db.QueryRow("SELECT password FROM users WHERE
+username = $1", username).Scan(&storedHash) if err != nil { if err ==
+sql.ErrNoRows { log.Printf("User not found: %s", username) return false, nil //
+User not found } log.Printf("Error querying user: %v", err) return false,
+fmt.Errorf("failed to query user: %v", err) } authenticated, err :=
+verifyPassword(password, storedHash) if err != nil { log.Printf("Error verifying
+password: %v", err) } return authenticated, err } // CreateUser creates a new
+user with a hashed password func (im *InventoryManager) CreateUser(username,
+password string) error { // Basic validation if username == "" { return
+fmt.Errorf("username cannot be empty") } if len(password) < 8 { return
+fmt.Errorf("password must be at least 8 characters long") } // Hash the password
+hashedPassword, err := hashPassword(password) if err != nil { return
+fmt.Errorf("failed to hash password: %v", err) } // Insert the user into the
+database _, err = im.db.Exec("INSERT INTO users (username, password) VALUES ($1,
+$2)", username, hashedPassword) if err != nil { if strings.Contains(err.Error(),
+"unique constraint") { return fmt.Errorf("username '%s' is already taken",
+username) } return fmt.Errorf("failed to create user: %v", err) } return nil }
+// requireLogin middleware ensures the user is logged in func requireLogin()
+gin.HandlerFunc { return func(c *gin.Context) { session := sessions.Default(c)
+userID := session.Get("user_id") log.Printf("Checking session for user_id: %v",
+userID) if userID == nil { log.Println("User not logged in, redirecting to
+/login") c.Redirect(http.StatusSeeOther, "/login") c.Abort() return }
+log.Printf("User %v is authenticated, proceeding to %s", userID,
+c.Request.URL.Path) c.Next() } } func main() { // Database connection string
+from environment variable connStr := os.Getenv("DATABASE_URL") if connStr == ""
+{ connStr = "host=db.drnlcdwagndslmveavcn.supabase.co port=5432 dbname=postgres
+user=postgres password=90464978aS! sslmode=disable" } // Connect to the database
+db, err := sql.Open("postgres", connStr) if err != nil { log.Fatalf("Error
+connecting to database: %v", err) } defer db.Close() // Test the connection if
+err := db.Ping(); err != nil { log.Fatalf("Error pinging database: %v", err) }
+// Initialize inventory manager im, err := NewInventoryManager(db) if err != nil
+{ log.Fatalf("Error initializing inventory manager: %v", err) } // Initialize
+Gin router r := gin.Default() // Setup session middleware secretKey :=
+os.Getenv("SESSION_SECRET") if secretKey == "" { secretKey = "secret-key-12345"
+log.Println("SESSION_SECRET not set, using default secret key") } store :=
+cookie.NewStore([]byte(secretKey)) store.Options(sessions.Options{ Path: "/",
+HttpOnly: true, MaxAge: 86400, // 24 hours })
+r.Use(sessions.Sessions("mysession", store)) // Load HTML templates
+r.LoadHTMLGlob("templates/*") // Serve static files (CSS) r.Static("/static",
+"./static") // Test session route (for debugging) r.GET("/test-session", func(c
+*gin.Context) { session := sessions.Default(c) userID := session.Get("user_id")
+if userID == nil { c.String(http.StatusUnauthorized, "No user_id in session")
+return } c.String(http.StatusOK, "User ID: %v", userID) }) // Login page
+r.GET("/login", func(c *gin.Context) { session := sessions.Default(c) if
+session.Get("user_id") != nil { log.Println("User already logged in, redirecting
+to /") c.Redirect(http.StatusSeeOther, "/") return } log.Println("Rendering
+login page") c.HTML(http.StatusOK, "login.html", gin.H{ "Error":
+c.Query("error"), "Success": c.Query("success"), }) }) // Handle login
+r.POST("/login", func(c *gin.Context) { username :=
+strings.TrimSpace(c.PostForm("username")) password :=
+strings.TrimSpace(c.PostForm("password")) authenticated, err :=
+im.AuthenticateUser(username, password) if err != nil {
+log.Printf("Authentication error: %v", err) c.Redirect(http.StatusSeeOther,
+"/login?error=Internal+server+error") return } if !authenticated {
+log.Println("Invalid credentials") c.Redirect(http.StatusSeeOther,
+"/login?error=Invalid+username+or+password") return } // Set session session :=
+sessions.Default(c) session.Set("user_id", username) log.Printf("Setting session
+user_id to: %s", username) if err := session.Save(); err != nil {
+log.Printf("Failed to save session: %v", err) c.Redirect(http.StatusSeeOther,
+"/login?error=Failed+to+save+session") return } log.Printf("User %s logged in
+successfully, redirecting to /", username) c.Redirect(http.StatusSeeOther, "/")
+}) // Sign-up page r.GET("/signup", func(c *gin.Context) { session :=
+sessions.Default(c) if session.Get("user_id") != nil { log.Println("User already
+logged in, redirecting to /") c.Redirect(http.StatusSeeOther, "/") return }
+log.Println("Rendering signup page") c.HTML(http.StatusOK, "signup.html", gin.H{
+"Error": c.Query("error"), }) }) // Handle sign-up r.POST("/signup", func(c
+*gin.Context) { username := strings.TrimSpace(c.PostForm("username")) password
+:= strings.TrimSpace(c.PostForm("password")) if err := im.CreateUser(username,
+password); err != nil { log.Printf("Sign-up error: %v", err)
+c.Redirect(http.StatusSeeOther, fmt.Sprintf("/signup?error=%s", err.Error()))
+return } log.Printf("User %s signed up successfully", username)
+c.Redirect(http.StatusSeeOther,
+"/login?success=Account+created+successfully.+Please+log+in.") }) // Logout
+r.GET("/logout", func(c *gin.Context) { session := sessions.Default(c)
+log.Printf("Logging out user: %v", session.Get("user_id")) session.Clear() if
+err := session.Save(); err != nil { log.Printf("Failed to save session after
+logout: %v", err) } c.Redirect(http.StatusSeeOther, "/login") }) // Protected
+routes r.GET("/", requireLogin(), func(c *gin.Context) { log.Println("Handling
+request for inventory page") items, err := im.ListItems() if err != nil {
+log.Printf("Error listing items: %v", err)
+c.String(http.StatusInternalServerError, "Error listing items: %v", err) return
+} log.Println("Rendering inventory page") c.HTML(http.StatusOK, "index.html",
+gin.H{ "Items": items, }) }) r.POST("/add", requireLogin(), func(c *gin.Context)
+{ name := strings.TrimSpace(c.PostForm("name")) quantityStr :=
+c.PostForm("quantity") priceStr := c.PostForm("price") password :=
+strings.TrimSpace(c.PostForm("password")) quantity, err :=
+strconv.Atoi(quantityStr) if err != nil { c.String(http.StatusBadRequest,
+"Invalid quantity: %v", err) return } price, err := strconv.ParseFloat(priceStr,
+64) if err != nil { c.String(http.StatusBadRequest, "Invalid price: %v", err)
+return } if err := im.AddItem(name, quantity, price, password); err != nil {
+c.String(http.StatusBadRequest, "Error adding item: %v", err) return }
+c.Redirect(http.StatusSeeOther, "/") }) r.GET("/update/:id", requireLogin(),
+func(c *gin.Context) { idStr := c.Param("id") id, err := strconv.Atoi(idStr) if
+err != nil { c.String(http.StatusBadRequest, "Invalid ID: %v", err) return }
+item, err := im.GetItem(id) if err != nil { c.String(http.StatusNotFound,
+"Error: %v", err) return } c.HTML(http.StatusOK, "update.html", gin.H{ "Item":
+item, }) }) r.POST("/update/:id", requireLogin(), func(c *gin.Context) { idStr
+:= c.Param("id") id, err := strconv.Atoi(idStr) if err != nil {
+c.String(http.StatusBadRequest, "Invalid ID: %v", err) return } name :=
+strings.TrimSpace(c.PostForm("name")) quantityStr := c.PostForm("quantity")
+priceStr := c.PostForm("price") password :=
+strings.TrimSpace(c.PostForm("password")) quantity, err :=
+strconv.Atoi(quantityStr) if err != nil { c.String(http.StatusBadRequest,
+"Invalid quantity: %v", err) return } price, err := strconv.ParseFloat(priceStr,
+64) if err != nil { c.String(http.StatusBadRequest, "Invalid price: %v", err)
+return } if err := im.UpdateItem(id, name, quantity, price, password); err !=
+nil { c.String(http.StatusBadRequest, "Error updating item: %v", err) return }
+c.Redirect(http.StatusSeeOther, "/") }) r.POST("/delete/:id", requireLogin(),
+func(c *gin.Context) { idStr := c.Param("id") id, err := strconv.Atoi(idStr) if
+err != nil { c.String(http.StatusBadRequest, "Invalid ID: %v", err) return } if
+err := im.DeleteItem(id); err != nil { c.String(http.StatusBadRequest, "Error
+deleting item: %v", err) return } c.Redirect(http.StatusSeeOther, "/") }) //
+Start the server port := os.Getenv("PORT") if port == "" { port = "8080" }
+log.Printf("Server running on port %s", port) if err := r.Run(":" + port); err
+!= nil { log.Fatalf("Error starting server: %v", err) } }
